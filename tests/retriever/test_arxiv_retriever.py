@@ -90,7 +90,7 @@ def test_run_with_hard_timeout_returns_none_on_failure(monkeypatch):
     assert "boom" in warnings[0]
 
 
-def test_arxiv_retriever_falls_back_to_per_paper_on_batch_http_error(
+def test_arxiv_retriever_uses_rss_metadata_on_batch_http_error(
     config, mock_feedparser, monkeypatch
 ):
     monkeypatch.setattr("zotero_arxiv_daily.retriever.base.sleep", lambda _: None)
@@ -101,39 +101,22 @@ def test_arxiv_retriever_falls_back_to_per_paper_on_batch_http_error(
         for entry in mock_feedparser.entries
         if entry.get("arxiv_announce_type", "new") == "new"
     ]
-    fake_results_by_id = {}
-    for entry in new_entries:
-        paper_id = entry.id.removeprefix("oai:arXiv.org:")
-        fake_results_by_id[paper_id] = SimpleNamespace(
-            title=entry.title,
-            authors=[SimpleNamespace(name="Test Author")],
-            summary="Test abstract",
-            pdf_url=f"https://arxiv.org/pdf/{paper_id}",
-            entry_id=f"https://arxiv.org/abs/{paper_id}",
-            source_url=lambda paper_id=paper_id: (
-                f"https://arxiv.org/e-print/{paper_id}"
-            ),
-        )
-
-    skipped_id = next(iter(fake_results_by_id))
+    paper_ids = [
+        entry.id.removeprefix("oai:arXiv.org:") for entry in new_entries
+    ]
     warnings: list[str] = []
+    calls: list[tuple[str, ...]] = []
+    client_kwargs = {}
 
     class FakeClient:
         def __init__(self, **kw):
-            pass
+            client_kwargs.update(kw)
 
         def results(self, search):
-            paper_ids = list(search.id_list)
-            if len(paper_ids) > 1:
-                raise arxiv_retriever.arxiv.HTTPError(
-                    "https://export.arxiv.org/api/query", 0, 406
-                )
-            paper_id = paper_ids[0]
-            if paper_id == skipped_id:
-                raise arxiv_retriever.arxiv.HTTPError(
-                    "https://export.arxiv.org/api/query", 0, 406
-                )
-            return iter([fake_results_by_id[paper_id]])
+            calls.append(tuple(search.id_list))
+            raise arxiv_retriever.arxiv.HTTPError(
+                "https://export.arxiv.org/api/query", 0, 406
+            )
 
     monkeypatch.setattr(arxiv_retriever.arxiv, "Client", FakeClient)
     monkeypatch.setattr(arxiv_retriever, "logger", SimpleNamespace(warning=warnings.append))
@@ -143,9 +126,9 @@ def test_arxiv_retriever_falls_back_to_per_paper_on_batch_http_error(
 
     papers = ArxivRetriever(config).retrieve_papers()
 
-    assert len(papers) == len(new_entries) - 1
-    assert skipped_id not in {
-        paper.url.removeprefix("https://arxiv.org/abs/") for paper in papers
-    }
-    assert any("Falling back to per-paper requests" in warning for warning in warnings)
-    assert any(f"Skipping arXiv paper {skipped_id}" in warning for warning in warnings)
+    assert len(papers) == len(new_entries)
+    assert calls == [tuple(paper_ids)]
+    assert client_kwargs == {"num_retries": 2, "delay_seconds": 3}
+    assert all(not paper.abstract.startswith("arXiv:") for paper in papers)
+    assert all(paper.authors for paper in papers)
+    assert any("Using RSS metadata for this batch" in warning for warning in warnings)
